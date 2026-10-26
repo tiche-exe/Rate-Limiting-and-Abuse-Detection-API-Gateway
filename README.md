@@ -1,644 +1,252 @@
-# CS335 Microsoft Project 3:
-## Rate Limiting and Abuse Detection API Gateway
+# Rate Limiting and Abuse Detection API Gateway
 
-> NOT FINAL / TO BE UPDATED (last update: April 9th 2026)
+A Spring Boot API gateway that sits in front of a simple notes service, enforcing API-key checks, rate limits and abuse detection, with a Grafana dashboard for monitoring.
 
----
+## About this repository
 
-## Project Overview
-> Added by Mateo
+This is my own version of a project I worked on as part of a team for CS335 (Project 3). The original team repository is here: https://github.com/ozdenur99/CS335-Project3
 
-This project implements a **Rate Limiting and Abuse Detection API Gateway**. Which is the single point of access for clients wanting to use backend services. The gateway handles incoming requests, routes valid ones to the appropriate service and protects backend services by controlling access frequency and detecting user misuse
+I took part in building the original project. This repository is a separate copy that I now maintain on my own, and any changes made here are my own work and are not part of the original team repository. The core design (gateway filter chain, rate-limiting algorithms, logging and metrics) comes from the team project, and credit for that shared work belongs to everyone who contributed to it.
 
-| | |
-|---|---|
-| **Language** | Java 21 |
-| **Framework** | Spring Boot 3.5.11 |
-| **Web Layer** | Spring MVC (via spring-boot-starter-web) |
-| **Build tool** | Maven Wrapper exclusively |
-| **Testing** | JUnit 5 (via spring-boot-starter-test) |
-| **State** | In-memory: ConcurrentHashMap for MVP (no database) |
-| **API Client** | Acts as a postman for all manual and automated testing |
+### What I've changed or added
+
+- _Add your own changes here, for example: "Rewrote the setup guide", "Added X feature", "Fixed Y"._
 
 ---
-For more details, please refer to our Docs.
-## Documentation
-- [Architecture Decisions (ADRs)](./docs/01-architecture/decisions.md)
-- [Testing Results](./docs/03-testing)
-- [Algorithms Logic Specs](./docs/02-algorithms)
-- [Weekly Meeting Minutes](./docs/04-communication/weekly-meetings.md)
-- [API Specification](./docs/01-architecture/endpoints.md)
 
 ## Architecture
 
-[ Client ]  ──►  [API Gateway: 8080]  ──►  [Backend Service: 8081]
+```
+[ Client ]  ──►  [ API Gateway 1 :8080 ]  ──┐
+                 [ API Gateway 2 :8082 ]  ──┼──►  [ Backend Service :8081 ]
+                                            │
+                         [ Redis :6379 ] ◄──┘   (shared rate-limit counters and blacklist)
 
+[ Grafana :3000 ]  reads metrics from the gateways
+[ Locust :8089 ]   generates load for testing
+```
 
-The API Gateway acts as a "middleman" between clients and a simple CRUD backend service, enforcing rate limits and detecting abuse patterns to protect the backend from excessive or malicious traffic
+| Technology | Details |
+|---|---|
+| Language | Java 21 |
+| Framework | Spring Boot 3.5.11 (Spring MVC) |
+| Build tool | Maven Wrapper |
+| Shared state | Redis |
+| Monitoring | Grafana (with the Infinity data source plugin) |
+| Load testing | Locust |
+| Runtime | Docker Compose |
 
-<img width="1488" height="1988" alt="Untitled-2026-03-19-1406" src="https://github.com/user-attachments/assets/f588bc33-5b06-4c89-afc3-1ba90c084f85" />
-
-Link to detailed Architecture Diagram: https://excalidraw.com/#room=f78d67fb86f551429f25,RjABcy6uMKNo5UiRu7y7tg
-
----
-
-## Key Features
-
-### Gateway Components
+## Features
 
 | Component | Behaviour |
-|-----------|-----------|
-| **API Key Validation** | Rejects requests with missing or invalid `X-API-Key` headers → `401 Unauthorized` |
-| **Rate Limiting** | In-memory counters limits the requests per client (`X` req/min) → `429 Too Many Requests` |
-| **Abuse Detection** | Detects spikes and repeated failures and it temporarily or permanently blocks them → `403 Forbidden` |
-| **Request Logging** | Captures the timestamp, API key, path, decision, and reason for every request |
-| **Request Forwarding** | Passes the validated requests to the backend service on `port 8081` |
+|---|---|
+| API key validation | Missing or invalid `X-API-Key` header returns `401 Unauthorized` |
+| Rate limiting | Token bucket, fixed window and sliding window algorithms; exceeding the limit returns `429 Too Many Requests` |
+| Abuse detection | Detects spikes and repeated failures; blocked clients get `403 Forbidden` |
+| Request logging and metrics | Records timestamp, key, IP, path, decision, reason, algorithm and latency for every request |
+| Bot detection | Flags IPs by request volume (LOW over 50, MEDIUM over 100, HIGH over 200) |
+| Request forwarding | Valid requests are forwarded to the backend service |
 
-### HTTP Status Codes
-
-| Code | Meaning |
-|------|---------|
-| `401 Unauthorized` | Invalid or missing API Key |
-| `429 Too Many Requests` | Rate limit exceeded |
-| `403 Forbidden` | Temporarily blocked due to abuse |
-
-### Request Path
-
-Every request passes through the Gateway filter chain in this order. The Backend never receives unauthenticated or rate-limited requests
-
-
-1. Client (aka Postman)  →  sends request with X-API-Key to `port 8080`
-2. ApiKeyFilter      →  invalid/missing key? returns `401 Unauthorized`
-3. RateLimitFilter   →  limit exceeded? returns `429 Too Many Requests`
-4. AbuseFilter       →  spiked/repeated failures? returns `429 Too Many Requests` or `403 Forbidden`
-5. RequestLogger     →  logs: timestamp, key, path, decision, reason
-6. Gateway           →  forwards request to Backend `port 8081`
-7. Backend           →  returns response -> Gateway passes it back unchanged
+Every request passes through the filter chain in this order: API key check, rate limit, abuse detection, logging, then forwarding to the backend.
 
 ---
 
-## Backend Service
+## Running the project
 
-The backend relies fully on the gateway. It has no built-in authentication or rate limiting algorithm
+Everything runs in Docker, so you don't need to install Java, Maven or Redis yourself.
 
-```
-POST   /api/{guid}/notes        →  Create a note
-GET    /api/{guid}/notes        →  List all notes
-PUT    /api/{guid}/notes/{id}   →  Update a note
-DELETE /api/{guid}/notes/{id}   →  Delete a note
-```
+### 1. Prerequisites
 
-> **Note:** `{guid}` represents a user/tenant scope, allowing the same backend to serve multiple clients
+- **Git**
+- **Docker Desktop**, installed and running
+  - On Windows, Docker Desktop needs WSL 2. If it shows a WSL error on startup, open PowerShell as Administrator and run:
+    ```powershell
+    wsl --install --no-distribution
+    wsl --update
+    wsl --shutdown
+    ```
+    Then restart your PC and reopen Docker Desktop.
 
----
+### 2. Clone the repository
 
-## Rate Limiting Algorithm
-
-Acts as a traffic controller for the API: setting and monitoring the frequency of client requests
-
-* **Prevents DoS/DDoS Attacks:** caps requests from a single source, defending against attempts to overwhelm the system
-* **Ensures Fair Use:** prevents any single client from monopolizing resources
-* **Protects Backend Services:** acts as a buffer against sudden traffic surges
-
----
-
-### Port Configuration
-
-Both services run simultaneously and must use different ports, if they conflict, neither will start
-
-| Service | Port | Config location |
-|---------|------|-----------------|
-| API Gateway | `8080` | `api-gateway/src/main/resources/application.properties` |
-| Backend Service | `8081` | `backend-service/src/main/resources/application.properties` |
-
-=========================================================
-## Using the API Gateway
-> Added by Cathy
-
-All requests to the gateway **must include** an `X-API-Key` header.
-
-### Valid dev keys (local development only)
-| Key | Purpose |
-|-----|---------|
-| `dev-key-token` | Local dev / testing |
-| `dev-key-fixed`  | Local dev / testing |
-| `dev-key-sliding`  | Local dev / testing |
-| `dev-key-business`  | Local dev / testing |
-
-### Example request (via curl)
 ```bash
-curl http://localhost:8080/api/test123/notes \
-  -H "X-API-Key: dev-key-token"
+git clone https://github.com/YOUR-USERNAME/YOUR-REPO.git
+cd YOUR-REPO
 ```
-=========================================================
 
+### 3. Start everything
 
-> The below has many overlap with the above section. Suggest to delete or modify them later.
-=========================================================
-# Backend + API Gateway System
-> Added by Avneet
+From the project root (the folder containing `docker-compose.yml`):
 
-This project contains a Spring Boot Backend Service and a custom API Gateway built using Spring MVC.
-
-The system follows a microservices-style architecture where:
-- Backend handles business logic (notes API)
-- API Gateway acts as the entry point and forwards requests using RestTemplate (manual routing)
-
---------------------------------------------------
-
-ARCHITECTURE
-
-Client (Browser / Postman)
-        ↓
-API Gateway (Port 8080)
-        ↓
-Backend Service (Port 8081)
-        ↓
-Response returned
-
---------------------------------------------------
-
-SERVICES & PORTS
-
-Backend Service → http://localhost:8081  
-API Gateway → http://localhost:8080  
-
---------------------------------------------------
-
-REQUIREMENTS
-- Java 21
-- Maven
---------------------------------------------------
-
-HOW TO RUN THE PROJECT
-Step 0 — Open Project
-cd CS335_project
---------------------------------------------------
-
-TERMINAL 1 — START BACKEND
-
-cd backend-service
-mvn clean install
-mvn spring-boot:run
-
-Expected Output:
-
-Tomcat started on port 8081  
-Started BackendServiceApplication  
-
-Test Backend:
-
-http://localhost:8081/health  
-
-Expected:
-Backend is running  
-
-Optional:
-http://localhost:8081/hello  
-
---------------------------------------------------
-
-TERMINAL 2  START API GATEWAY
-
-(Open new terminal)
-
-cd api-gateway
-mvn clean install
-mvn spring-boot:run
-
-Expected Output:
-
-Tomcat started on port 8080  
-Started ApiGatewayApplication  
-
---------------------------------------------------
-
-IMPORTANT
-
-- Always start Backend first  
-- Then start Gateway  
-- Keep both terminals running  
-
---------------------------------------------------
-
-API ENDPOINTS (BACKEND)
-
-All note operations require a GUID (example: test123)
-
---------------------------------------------------
-
-1. GET ALL NOTES
-
-curl http://localhost:8081/api/test123/notes
-
-Expected Output:
-[]  
-OR  
-[{"id":"1","content":"My first note"}]
-
---------------------------------------------------
-
-2. CREATE NOTE
-
-curl -X POST http://localhost:8081/api/test123/notes \
--H "Content-Type: application/json" \
--d '{"id":"1","content":"My first note"}'
-
---------------------------------------------------
-
-3. UPDATE NOTE
-
-curl -X PUT http://localhost:8081/api/test123/notes/1 \
--H "Content-Type: application/json" \
--d '{"id":"1","content":"Updated note"}'
-
---------------------------------------------------
-
-4. DELETE NOTE
-
-curl -X DELETE http://localhost:8081/api/test123/notes/1
-
---------------------------------------------------
-
-USING API GATEWAY (MAIN ENTRY POINT)
-
-Instead of calling backend directly, use:
-
-http://localhost:8080/api/test123/notes  
-
---------------------------------------------------
-
-HOW IT WORKS
-
-1. Client sends request to API Gateway (port 8080)  
-2. GatewayController receives the request  
-3. Gateway forwards request to backend using RestTemplate  
-4. Backend processes request  
-5. Response is returned through Gateway  
-
----
-
-## Logging & Metrics Module
-> Added by Mateo
-
-Records every request passing through the gateway and tracks whether it was allowed or blocked. Results are viewable at `/metrics` for live counts and `/metrics/logs` for the last 100 requests
-
-It sits at the outermost layer of the filter chain (`@Order(1)`) and wraps all requests that come through the gateway. It captures and displays: timestamp, API key, client IP, path, decision (ALLOWED/BLOCKED), reason, and which rate limiting algorithm was used
-
-It also includes bot detection which automatically flags IPs that exceed 50 requests (threshold can be changed in `BotDetector.java`)
-
----
-
-### Files
-
-| File | Description |
-|------|-------------|
-| `LogEntry.java` | Data model for a single request log record |
-| `RequestLogger.java` | Thread-safe queue that stores up to 100 log entries |
-| `MetricsService.java` | Tracks total, blocked, and per-key request counts |
-| `MetricsController.java` | REST endpoints to expose metrics, logs, filters, and exports |
-| `LoggingFilter.java` | Filter chain wrapper that records every request outcome |
-| `BotDetector.java` | Flags IPs that exceed the suspicious request threshold |
-| `LogForwarder.java` | Forwards every log entry to the backend in real time |
-| `MetricsExporter.java` | Auto-exports metrics snapshot to a JSON file every hour |
-
----
-
-## Starting the Services
-
-Both the backend and gateway must be running simultaneously. Always start the backend first. Redis must also be running as it is required by the rate limiter
-
-**Terminal 1: Start Redis (from project root)**
 ```bash
-docker compose up redis
+docker compose up --build
 ```
-Wait until you see `Ready to accept connections tcp` then press **d** to detach
 
-**Terminal 2: Start the Backend**
-```bash
-cd backend-service
-./mvnw spring-boot:run
-```
-Wait until you see `Tomcat started on port 8081`
+The first run takes a few minutes while the backend and gateways build. Leave this terminal open, because closing it stops the services.
 
-**Terminal 3: Start the Gateway**
-```bash
-cd api-gateway
-./mvnw spring-boot:run
-```
-Wait until you see `Tomcat started on port 8080`
+This starts:
 
----
+| Service | URL |
+|---|---|
+| Gateway 1 | http://localhost:8080 |
+| Gateway 2 | http://localhost:8082 |
+| Backend | http://localhost:8081 |
+| Redis | localhost:6379 |
+| Grafana | http://localhost:3000 |
+| Locust | http://localhost:8089 |
 
-## Valid API Keys
+### 4. Check it works
 
-| Key | Algorithm | Limit |
-|-----|-----------|-------|
-| `dev-key-token` | Token Bucket | 3 req/window |
-| `dev-key-fixed` | Fixed Window | 3 req/window |
-| `dev-key-sliding` | Sliding Window | 3 req/window |
-| `dev-key-business` | Token Bucket | 10 req/window |
+Open http://localhost:8080/metrics in a browser. If it loads, the gateway is running.
 
-> **Note:** Limits are temporarily set to 3 for testing (can be modified)
+Send a test request (PowerShell):
 
----
-
-## Sending Test Requests
-
-If PowerShell shows a security warning, press **A (Yes to All)** to continue
-
-**Valid Request (expect 200)**
 ```powershell
 curl -Uri "http://localhost:8080/api/test123/notes" -Headers @{"X-API-Key"="dev-key-token"}
 ```
-Expected result: request passes through to the backend and returns `[]`
 
-**Invalid API Key (expect 401)**
-```powershell
-curl -Uri "http://localhost:8080/api/test123/notes" -Headers @{"X-API-Key"="bad-key"}
-```
-Expected result:
-```json
-{"status":401,"error":"Unauthorized","message":"Request could not be authorised.","path":"/api/test123/notes"}
-```
+Mac or Linux:
 
-**Burst Requests to Trigger Rate Limit (expect 429 after 3rd request)**
-```powershell
-1..8 | ForEach-Object {
-    try {
-        $r = Invoke-WebRequest -Uri "http://localhost:8080/api/test123/notes" -Headers @{"X-API-Key"="dev-key-fixed"}
-        Write-Host "Request $_`: $($r.StatusCode)"
-    } catch {
-        $code = $_.Exception.Response.StatusCode.value__
-        Write-Host "Request $_`: $code"
-    }
-}
-```
-Expected result: first 3 requests return 200, remaining return 429
-
-**Abuse Detection (expect 403)**
-```powershell
-1..12 | ForEach-Object {
-    try {
-        $r = Invoke-WebRequest -Uri "http://localhost:8080/api/test/notes" -Headers @{"X-API-Key"="dev-key-sliding"}
-        Write-Host "Request $_`: $($r.StatusCode)"
-    } catch {
-        $code = $_.Exception.Response.StatusCode.value__
-        Write-Host "Request $_`: $code"
-    }
-}
-```
-Expected result: returns 403 around request 12 once the abuse detection threshold is hit
-
-**Bot Detection (expect IP flagged after 50+ requests)**
-```powershell
-1..55 | ForEach-Object {
-    try {
-        Invoke-WebRequest -Uri "http://localhost:8080/api/test123/notes" -Headers @{"X-API-Key"="dev-key-token"} | Out-Null
-    } catch {}
-    Write-Host "Request $_"
-}
-```
-Then check `http://localhost:8080/metrics/suspicious` (should show the flagged IP)
-
----
-
-### Using IntelliJ Terminal
-
-The same PowerShell commands work in the IntelliJ terminal. Open it via the **Terminal** tab at the bottom of IntelliJ.
-
-Alternatively use curl on Mac or Linux:
 ```bash
 curl http://localhost:8080/api/test123/notes -H "X-API-Key: dev-key-token"
 ```
 
----
+You should get `[]` back. A bad key (for example `bad-key`) returns `401`.
 
-### Using Postman
+### 5. Stop everything
 
-1. Open Postman and create a new request
-2. Set the method to **GET**
-3. Set the URL to `http://localhost:8080/api/test123/notes`
-4. Go to the **Headers** tab and add `X-API-Key` as the key and `dev-key-token` as the value
-5. Click **Send**
+Press `Ctrl+C` in the terminal running Compose, then run:
 
-To trigger the rate limit click Send rapidly more than 3 times with the same key.
-
----
-
-## Checking Metrics and Logs
-
-No API key is required for any of the endpoints below.
-
-```
-http://localhost:8080/metrics
-http://localhost:8080/metrics/logs
-http://localhost:8080/metrics/suspicious
+```bash
+docker compose down
 ```
 
-### Example `/metrics` response
-```json
-{
-  "totalRequests": 8,
-  "blockedRequests": 2,
-  "allowedRequests": 6,
-  "perKey": {
-    "dev-key-token": 3,
-    "dev-key-fixed": 4,
-    "MISSING": 1
-  }
+---
+
+## Setting up the Grafana dashboard
+
+Grafana runs at http://localhost:3000 with anonymous admin access, so no login is needed.
+
+The dashboard (`dashboard.json`) refers to two data sources by fixed IDs: one for Gateway 1 and one for Gateway 2. A fresh Grafana doesn't have them, so create them first.
+
+### 1. Create the two data sources
+
+Run this in a new PowerShell window while the containers are running:
+
+```powershell
+$gw = @(
+  @{ name="Gateway 1"; uid="dfk5lf85xepz4f"; url="http://gateway1:8080" },
+  @{ name="Gateway 2"; uid="afk5lqu9tk3k0d"; url="http://gateway2:8080" }
+)
+foreach ($g in $gw) {
+  $body = @{
+    name = $g.name
+    uid = $g.uid
+    type = "yesoreyeram-infinity-datasource"
+    access = "proxy"
+    url = $g.url
+    jsonData = @{ allowedHosts = @($g.url) }
+  } | ConvertTo-Json -Depth 5
+  Invoke-RestMethod -Method Post -Uri "http://localhost:3000/api/datasources" -ContentType "application/json" -Body $body
 }
 ```
 
-### Example `/metrics/logs` response
-```json
-[
-  {
-    "timestamp": "2026-04-07T14:02:11",
-    "apiKey": "dev-key-token",
-    "ip": "127.0.0.1",
-    "path": "/api/test123/notes",
-    "decision": "ALLOWED",
-    "reason": "ok",
-    "algorithm": "token",
-    "latencyMs": 12
-  }
-]
-```
+The URLs use the Docker service names (`gateway1`, `gateway2`) because Grafana runs inside Docker, where `localhost` would point at Grafana itself.
+
+### 2. Import the dashboard
+
+1. Go to http://localhost:3000/dashboard/import
+2. Upload `dashboard.json` from the project root, then click **Load**.
+3. Click **Import**.
+
+### 3. Set the time range
+
+The saved dashboard has an old fixed time range. At the top right, change it to **Last 15 minutes** and turn on auto-refresh.
 
 ---
 
-## Filtering Logs
+## Generating traffic
 
-Filter by any combination of fields (no API key required)
+The dashboard stays empty until requests go through the gateways.
 
-```
-http://localhost:8080/metrics/logs/filter?decision=BLOCKED
-http://localhost:8080/metrics/logs/filter?decision=ALLOWED
+### PowerShell script
 
-http://localhost:8080/metrics/logs/filter?reason=ok
-http://localhost:8080/metrics/logs/filter?reason=rate_limit_exceeded
-http://localhost:8080/metrics/logs/filter?reason=invalid_or_missing_key
-http://localhost:8080/metrics/logs/filter?reason=abuse_detected
+This sends 120 requests to each gateway using a mix of valid and invalid keys:
 
-http://localhost:8080/metrics/logs/filter?apiKey=dev-key-token
-http://localhost:8080/metrics/logs/filter?apiKey=dev-key-fixed
-http://localhost:8080/metrics/logs/filter?apiKey=dev-key-sliding
-http://localhost:8080/metrics/logs/filter?apiKey=dev-key-business
-
-http://localhost:8080/metrics/logs/filter?algorithm=token
-http://localhost:8080/metrics/logs/filter?algorithm=fixed
-http://localhost:8080/metrics/logs/filter?algorithm=sliding
-```
-
-Multiple filters can be combined:
-```
-http://localhost:8080/metrics/logs/filter?decision=BLOCKED&algorithm=token
-```
-
----
-
-## Exporting Logs
-
-Both links automatically download a file (no API key required)
-
-```
-http://localhost:8080/metrics/logs/export/json
-```
-Downloads `logs.json` with all current log entries.
-
-```
-http://localhost:8080/metrics/logs/export/csv
-```
-Downloads `logs.csv` which can be opened directly in Excel.
-
----
-
-## New Features (Added 14th April 2026)
-
----
-
-### Feature 1: Request Latency Tracking
-
-Every log entry now includes `latencyMs` showing how long the request took in milliseconds. `MetricsService` aggregates these into p50, p95, and p99 percentiles per client so you can check how efficiently requests are being processed at different points. p50 is the median speed, p95 covers 95% of requests, and p99 shows the worst case
-
-A risk score per client also shows how close each client is to hitting the rate limit as a percentage. `MetricsExporter.java` automatically saves the full metrics snapshot to a timestamped JSON file every hour in the `metrics/` folder so data survives container restarts
-
-**Check latency percentiles per client:**
-```
-http://localhost:8080/metrics/latency?apiKey=dev-key-token
-http://localhost:8080/metrics/latency?apiKey=dev-key-fixed
-http://localhost:8080/metrics/latency?apiKey=dev-key-sliding
-```
-Expected response:
-```json
-{
-  "apiKey": "dev-key-token",
-  "percentiles": { "p50": 10, "p95": 45, "p99": 80 },
-  "statusCodes": { "200": 3, "429": 5 },
-  "riskScore": "100%"
+```powershell
+$keys = "dev-key-token","dev-key-fixed","dev-key-sliding","dev-key-business","bad-key"
+foreach ($port in 8080, 8082) {
+    1..120 | ForEach-Object {
+        $k = $keys | Get-Random
+        try {
+            Invoke-WebRequest -Uri "http://localhost:$port/api/test123/notes" -Headers @{"X-API-Key"=$k} | Out-Null
+        } catch {}
+    }
 }
 ```
 
-**Check risk scores for all clients:**
-```
-http://localhost:8080/metrics/risk
-```
+It prints nothing when it works. Afterwards check http://localhost:8080/metrics and http://localhost:8082/metrics, then refresh Grafana.
 
-**Auto-export test:** temporarily change `@Scheduled(fixedRate = 3600000)` to `@Scheduled(fixedRate = 10000)` in `MetricsExporter.java`, restart the gateway, wait 10 seconds and check for a new `metrics/` folder in `api-gateway/` containing a timestamped JSON file. Change back to `3600000` after testing
+### Locust
 
----
-
-### Feature 2: Risk Levels for Suspicious IPs
-
-Suspicious IPs are now grouped into three risk tiers based on total request volume rather than just being flagged or not
-
-| Risk Level | Threshold | Meaning |
-|------------|-----------|---------|
-| `LOW` | Over 50 requests | Elevated traffic, flagged for monitoring |
-| `MEDIUM` | Over 100 requests | High volume, likely automated |
-| `HIGH` | Over 200 requests | Very high volume, likely bot or DDoS source |
-
-Send 55+ requests to flag an IP then check:
-```
-http://localhost:8080/metrics/suspicious/risk
-```
-Expected response:
-```json
-{
-  "HIGH":   [],
-  "MEDIUM": [],
-  "LOW":    ["127.0.0.1"]
-}
-```
-
-> Send 100+ requests to see MEDIUM and 200+ for HIGH.
+1. Open http://localhost:8089
+2. Set the host to `http://gateway1:8080`, choose a number of users, and click **Start**.
 
 ---
 
-### Feature 3: Send Logs to Backend in Real Time
+## API keys
 
-Every log entry is now forwarded to the backend in real time via `LogForwarder.java`. A new `LogController.java` was added to the backend to receive and store them. If the backend is unreachable the gateway keeps running normally and forwarding never blocks or crashes the gateway
+| Key | Algorithm |
+|---|---|
+| `dev-key-token` | Token bucket |
+| `dev-key-fixed` | Fixed window |
+| `dev-key-sliding` | Sliding window |
+| `dev-key-business` | Token bucket (higher limit) |
 
-After sending any requests check:
+These are local development keys only. All gateway requests must include an `X-API-Key` header.
+
+## Backend endpoints
+
+Accessed through the gateway, where `{guid}` is a user or tenant scope such as `test123`:
+
 ```
-http://localhost:8081/api/logs
+POST   /api/{guid}/notes        Create a note
+GET    /api/{guid}/notes        List all notes
+PUT    /api/{guid}/notes/{id}   Update a note
+DELETE /api/{guid}/notes/{id}   Delete a note
 ```
-Should show the same entries as `http://localhost:8080/metrics/logs` confirming logs are being forwarded in real time
 
----
+## Metrics endpoints
 
-## All Endpoints Reference
+No API key is needed for these.
 
 | Endpoint | Description |
-|----------|-------------|
-| `GET /metrics` | Totals, blocked, allowed, per-key counts, risk scores |
-| `GET /metrics/logs` | Last 100 requests with full details and latency |
-| `GET /metrics/logs/filter?...` | Filter by decision, reason, apiKey, or algorithm |
-| `GET /metrics/logs/export/json` | Download all logs as a JSON file |
-| `GET /metrics/logs/export/csv` | Download all logs as a CSV file |
-| `GET /metrics/suspicious` | All IPs flagged as potential bots |
-| `GET /metrics/suspicious/risk` | Flagged IPs grouped by HIGH/MEDIUM/LOW risk |
-| `GET /metrics/latency?apiKey=...` | p50/p95/p99 latency, status codes, risk score per client |
-| `GET /metrics/risk` | Risk score percentage for all tracked clients |
-| `GET /api/logs` (backend port 8081) | All log entries forwarded from the gateway |
+|---|---|
+| `GET /metrics` | Totals, blocked, allowed and per-key counts |
+| `GET /metrics/logs` | Last 100 requests with full details |
+| `GET /metrics/logs/filter?...` | Filter by decision, reason, apiKey or algorithm |
+| `GET /metrics/logs/export/json` | Download logs as JSON |
+| `GET /metrics/logs/export/csv` | Download logs as CSV |
+| `GET /metrics/suspicious` | IPs flagged as possible bots |
+| `GET /metrics/suspicious/risk` | Flagged IPs grouped by HIGH, MEDIUM and LOW risk |
+| `GET /metrics/latency?apiKey=...` | p50, p95 and p99 latency, status codes and risk score per client |
+| `GET /metrics/risk` | Risk score for all tracked clients |
 
-> No API key is required for any of these endpoints.
 ---
 
-## Overall Project Overview & Progress
+## Troubleshooting
 
-TECHNOLOGIES USED
+| Problem | Fix |
+|---|---|
+| Docker Desktop shows a WSL error | Run the WSL commands in the prerequisites, then restart your PC |
+| `docker compose` command fails | Make sure Docker Desktop is running and you're in the project root |
+| Port already in use | Close whatever is using 3000, 6379, 8080, 8081, 8082 or 8089 |
+| Grafana panels show "No data" | Check the time range is **Last 15 minutes**, that both data sources exist, and that you've sent traffic to both gateways |
+| Grafana says a data source is not found | Run the data source script again |
+| `/metrics` shows zero counts | Requests aren't reaching that gateway, so check the port (8080 or 8082) |
 
-- Java  
-- Spring Boot (3.5.11)  
-- Maven  
-- REST APIs  
+Metrics are held in memory per gateway and reset when the containers restart.
 
---------------------------------------------------
+## Credits
 
-COMMON ISSUES
-
-Port conflict → Ensure backend = 8081, gateway = 8080  
-404 error → Check correct endpoint (/api/...)  
-500 error → Backend not running  
-Connection refused → Start backend first  
-
---------------------------------------------------
-
-FINAL CHECKLIST
-
-Backend running on 8081  
-Gateway running on 8080  
-/health works on backend  
-/api/test123/notes works on gateway  
-
---------------------------------------------------
-
-PROJECT STATUS
-
-Backend Service — Working  
-API Gateway — Working  
-Manual Routing — Implemented  
-End-to-End Communication — Working  
-=======
+Based on the CS335 Project 3 team repository: https://github.com/ozdenur99/CS335-Project3
